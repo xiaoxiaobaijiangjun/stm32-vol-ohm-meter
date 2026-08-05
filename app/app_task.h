@@ -1,8 +1,10 @@
 /*
  * app_task.h
  *
- *  Created on: 2026年1月26日
- *      Author: jlc
+ * Application entry points called from main().
+ *
+ *  Created on: 2026-01-26
+ *      Author: xiaoxiaobaijiangjun
  */
 
 #ifndef APP_TASK_H_

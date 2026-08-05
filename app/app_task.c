@@ -1,59 +1,63 @@
 /*
  * app_task.c
  *
- *  Created on: 2026年1月26日
- *      Author: jlc
+ * Application layer: measurement modes, UI pages and key handling.
+ *
+ *  Created on: 2026-01-26
+ *      Author: xiaoxiaobaijiangjun
  */
 
 #include "app_task.h"
 #include "../hardware/hw_key.h"
 #include "../hardware/hw_lcdinit.h"
-#include "../middle/mid_kalman.h"
 #include "../middle/mid_lcd.h"
 #include "../middle/mid_filter.h"
 #include "stdio.h"
 #include "adc.h"
 
-#define ADC_CH_NUM	7	//adc channel number
-#define VOL_RANGE_0_5 	0x01	// vol range 0v-5v flag
-#define VOL_RANGE_5_15	0x02	// vol range 5v-15v flag
-#define RES_RANGE_0_1	0x03	// res range 0r-1k flag
-#define RES_RANGE_1_100	0x04	// res range 1k-100k flag
-#define RES_MODE		0x05	// res mode
-#define VOL_MODE		0x06	// vol mode
-#define BUZ_MODE		0x07	// buz mode
+#define ADC_CH_NUM		7		/* number of ADC channels scanned by DMA   */
+#define VOL_RANGE_0_5	0x01	/* voltage range 0V - 5V                   */
+#define VOL_RANGE_5_15	0x02	/* voltage range 5V - 15V                  */
+#define RES_RANGE_0_1	0x03	/* resistance range 0R - 1K                */
+#define RES_RANGE_1_100	0x04	/* resistance range 1K - 100K              */
+#define RES_MODE		0x05	/* resistance measurement mode             */
+#define VOL_MODE		0x06	/* voltage measurement mode                */
+#define BUZ_MODE		0x07	/* continuity (buzzer) mode                */
 
 static lcd_parameter lcd_p;
 static lcd_interface lcd_t;
 static key_handle_t mode_key;
 
-static uint16_t adc_buf[ADC_CH_NUM];	// adc dma buffer
-static volatile uint8_t key_trigger_bit = 0;	// key interrupt flag
-static volatile uint8_t adc_dma_done = 0;		// adc transition complete flag
-static volatile uint8_t sample_cnt = 0;			//cumsum num
-static uint8_t mode_sel = VOL_MODE;	//mode select,default vol mode
-static uint8_t range_sel = VOL_RANGE_5_15;	// range select, default range is 5v-15v
-static uint32_t ref_165_sum;	//ref_165_vol cumsum
-static uint32_t vol1_sum;		//vol vin1 cumsum
-static uint32_t vol2_sum;		//vol vin2 cumsum
-static uint32_t res_in1_sum;	//resistance vin2 vol cumsum
-static uint32_t res_in2_sum;	//resistance vin1 vol cumsum
-static uint32_t ref_230_sum;	//ref_230_vol cumsum
-static uint32_t vref_sum;		//interior vref sum
+static uint16_t adc_buf[ADC_CH_NUM];			/* ADC DMA conversion buffer     */
+static volatile uint8_t key_trigger_bit = 0;	/* set by the key EXTI handler  */
+static volatile uint8_t adc_dma_done = 0;		/* one 64-round ADC batch ready */
+static volatile uint8_t sample_cnt = 0;			/* rounds accumulated so far    */
+static uint8_t mode_sel = VOL_MODE;				/* current mode, default: volt  */
+static uint8_t range_sel = VOL_RANGE_5_15;		/* current range, default 5-15V */
+static uint32_t ref_165_sum;	/* 1.65V reference, cumulative ADC raw      */
+static uint32_t vol1_sum;		/* voltage channel 1 (0-5V divider), raw    */
+static uint32_t vol2_sum;		/* voltage channel 2 (5-15V divider), raw   */
+static uint32_t res_in1_sum;	/* resistance node 1 (0-1K path), raw       */
+static uint32_t res_in2_sum;	/* resistance node 2 (1K-100K path), raw    */
+static uint32_t ref_230_sum;	/* 2.30V-ish reference node, raw            */
+static uint32_t vref_sum;		/* STM32 internal VREFINT, raw              */
 static float old_vol1_val;
 static float old_vol2_val;
+static uint32_t key_last_scan_tick = 0;		/* tick of the last Key_Scanf() call */
+static uint32_t key_event_start_tick = 0;	/* tick when the current key event began */
 
 static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range);
 static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range);
 static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range);
 static void key_handle(key_handle_t *key_t,lcd_interface *lcd_t,uint8_t *mode_sel,uint8_t *range_sel);
+static void process_key_event(void);
 static void reset_adc_gather(uint16_t * adc_buf);
-static void show_hint(lcd_interface *lcd_t);
 
 void init_task(void)
 {
 	register_1_80_lcd(&lcd_p,&lcd_t);
 	mode_key = Key_Init(MODE_GPIO_Port,MODE_Pin,GPIO_PIN_RESET);
+	key_last_scan_tick = HAL_GetTick();
 	lcd_t.lcd_init(&lcd_t);
 	lcd_t.lcd_exit_sleep(&lcd_t);
 	lcd_fill(&lcd_t,0,0,lcd_t.lcd_p->lcd_height,lcd_t.lcd_p->lcd_width,BLACK);
@@ -63,29 +67,7 @@ void init_task(void)
 
 void cycle_task(void)
 {
-	if(key_trigger_bit > 0)
-	{
-		if(HAL_GPIO_ReadPin(mode_key.key_gpio,mode_key.key_pin) == mode_key.key_press_level)
-		{
-			for(uint16_t i=0;i<500;i++)
-			{
-				Key_Scanf(&mode_key);
-				HAL_Delay(10);
-				if(mode_key.key_state != KEY_NoPress){
-					break;
-				}
-			}
-		}
-		else
-		{
-			if(key_trigger_bit == 1){
-				mode_key.key_state = KeyPress;
-			}
-		}
-		key_handle(&mode_key,&lcd_t,&mode_sel,&range_sel);
-		mode_key.key_state = KEY_NoPress;
-		key_trigger_bit = 0;
-	}
+	process_key_event();
 	if(mode_sel == VOL_MODE){
 		show_volatge_page(&lcd_t,&adc_buf[0],&range_sel);
 	}
@@ -94,6 +76,69 @@ void cycle_task(void)
 	}
 	else if(mode_sel == BUZ_MODE){
 		show_beep_page(&lcd_t,&adc_buf[0],&range_sel);
+	}
+}
+
+/*
+ * Non-blocking key event processor.
+ *
+ * The MODE key triggers EXTI on the falling edge, which only sets
+ * key_trigger_bit. The debounce state machine is then driven here at a
+ * 10 ms cadence, so the measurement pages keep refreshing while a key
+ * event is being resolved (the old implementation blocked in HAL_Delay
+ * for up to 5 s).
+ *
+ * Result mapping:
+ *   KeyPress        -> cycle Voltage / Resistance / Continuity
+ *   KeyDoublePress  -> reserved (no-op)
+ *   KeyLongPress    -> reserved for future features, e.g. calibration
+ */
+static void process_key_event(void)
+{
+	uint32_t now;
+
+	if(key_trigger_bit == 0){
+		return;
+	}
+	now = HAL_GetTick();
+
+	if(mode_key.key_state != KEY_NoPress)
+	{
+		/* Debounce finished: dispatch the event and close the handling. */
+		key_handle(&mode_key,&lcd_t,&mode_sel,&range_sel);
+		mode_key.key_state = KEY_NoPress;
+		key_trigger_bit = 0;
+		key_event_start_tick = 0;
+		return;
+	}
+
+	if(key_event_start_tick == 0)
+	{
+		/* New event: record when it started. */
+		key_event_start_tick = now;
+		key_last_scan_tick = now;
+
+		/* The EXTI edge already proves the key went down; if it is
+		 * already up again (very short tap), count it as a completed
+		 * short press right away. */
+		if(HAL_GPIO_ReadPin(mode_key.key_gpio,mode_key.key_pin) != mode_key.key_press_level){
+			mode_key.key_state = KeyPress;
+		}
+		return;
+	}
+
+	/* Feed the debounce state machine at a 10 ms cadence. */
+	if((now - key_last_scan_tick) >= 10){
+		key_last_scan_tick = now;
+		Key_Scanf(&mode_key);
+	}
+
+	/* Safety net: the key is already released but the debouncer did not
+	 * report an event (tap shorter than the 20 ms debounce window).
+	 * Complete the press so the button can never get stuck. */
+	if((HAL_GPIO_ReadPin(mode_key.key_gpio,mode_key.key_pin) != mode_key.key_press_level)
+		&& ((now - key_event_start_tick) >= 50)){
+		mode_key.key_state = KeyPress;
 	}
 }
 
@@ -110,19 +155,18 @@ static void reset_adc_gather(uint16_t * adc_buf)
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_CH_NUM);
 }
 
-static inline float my_fabs(float x)
-{
-    return (x < 0.0f) ? -x : x;
-}
-
 /*
- * Function Content: show volatge value;
- * 					notic offset_vol need manual measurement,
- * 					The output voltage value of the follower when unloaded
- * Function Parameter: lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t range
- * Return Value: null
- * notice: offset_val is vol input connect to GND offset val,
- * 			No remove of levitate noise!!!
+ * Voltage page: shows the measured input voltage.
+ *
+ * The analog front-end divides the input and level-shifts it around the
+ * 1.65 V reference, so the software subtracts the measured reference
+ * (ref165_vol) and scales back by the divider ratio:
+ *   0-5V  range: V_in = (vol1 - ref165) * 13.3 / 3.3
+ *   5-15V range: V_in = (vol2 - ref165) * 11
+ *
+ * offset_val is the follower output offset measured with the input
+ * shorted to GND (hard-coded 5 mV; a future calibration feature will
+ * make it user-adjustable and store it in Flash).
  */
 static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range)
 {
@@ -159,7 +203,7 @@ static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *ra
 
     if(*range == VOL_RANGE_0_5){
     	offset_val = 0.005f;
-		lcd_showString(lcd_t,100,2,(uint8_t *)"0--5V",
+		lcd_showString(lcd_t,100,2,(uint8_t *)"0-5V",
 						LGRAY, BLACK, 16, 0);
 		if(vol1_val >= ref165_vol){
 			filter_vol = (vol1_val - ref165_vol - offset_val) * 13.3f / 3.3f * 1000;
@@ -171,7 +215,7 @@ static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *ra
     }
     else{
     	offset_val = 0.005f;
-    	lcd_showString(lcd_t,100,2,(uint8_t *)"0-15V",
+    	lcd_showString(lcd_t,100,2,(uint8_t *)"5-15V",
     			  				LGRAY, BLACK, 16, 0);
     	if(vol2_val >= ref165_vol){
     		filter_vol = (vol2_val - ref165_vol - offset_val) * 11.0f * 1000;
@@ -181,7 +225,7 @@ static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *ra
 			sign = 0;
 		}
     }
-    vin_vol = Moving_Average(filter_vol);
+    vin_vol = (uint16_t)(Moving_Average(filter_vol) + 0.5f);
     if (vin_vol < 5000) {
         vol_color = GREEN;
     } else if (vin_vol < 10000) {
@@ -211,10 +255,23 @@ static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *ra
 
 static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range)
 {
+    /*
+     * Resistance page.
+     *
+     * A constant current is derived from the two reference nodes:
+     *   I = (2 * ref165 - ref230) / 1000  [A], about 1.2 mA.
+     *
+     *   0R-1K    range: R = res1_in / I
+     *   1K-100K  range: 10k series resistor, voltage divider formula
+     *                    R = 10k * res2_in / (2 * ref165 - res2_in)
+     *
+     * The range is auto-detected from res1_in and the beeper gives an
+     * audible cue near the range limits.
+     */
     char show_data[32];
     uint16_t res_color = 0;
     uint32_t resistance = 0;
-    float ref165_vol = 0,res1_in = 0,res2_in,ref230_vol = 0;
+    float ref165_vol = 0,res1_in = 0,res2_in = 0,ref230_vol = 0;
     float current_val = 0;
 
     if(adc_dma_done != 1){
@@ -282,12 +339,12 @@ static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t 
     resistance = Moving_Average_res(resistance);
     if (resistance < 1000) {
         snprintf(show_data, sizeof(show_data),
-                 "%6ld", resistance);
+                 "%6lu", (unsigned long)resistance);
     } else {
         snprintf(show_data, sizeof(show_data),
-                 "%3ld.%02ld",
-                 resistance / 1000,
-                 (resistance % 1000) / 10);
+                 "%3lu.%02lu",
+                 (unsigned long)(resistance / 1000),
+                 (unsigned long)((resistance % 1000) / 10));
     }
     lcd_showString(lcd_t,24,48,(uint8_t *)show_data,
                    res_color, BLACK, 32, 0);
@@ -308,6 +365,10 @@ static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t 
 
 static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range)
 {
+    /*
+     * Continuity page: same front-end as the resistance mode, but the
+     * buzzer stays on while the measured resistance is below 15 ohms.
+     */
     char show_data[32];
     uint16_t res_color = 0;
     uint32_t resistance = 0;
@@ -325,7 +386,6 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
 
     ref165_vol = ref_165_sum * 1.0f / vref_sum * 1.21f;
     res1_in = res_in1_sum * 1.0f / vref_sum * 1.21f;
-    //res2_in = res_in2_sum * 1.0f / vref_sum * 1.21f;
     ref230_vol = ref_230_sum * 1.0f / vref_sum * 1.21f;
 
     reset_adc_gather(adc_buf);
@@ -354,7 +414,7 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
     resistance = Moving_Average_res(resistance);
     if(resistance <= 15){
     	snprintf(show_data, sizeof(show_data),
-				 "%6ld", resistance);
+				 "%6lu", (unsigned long)resistance);
 		lcd_showString(lcd_t,24,48,(uint8_t *)show_data,
 						   res_color, BLACK, 32, 0);
 		lcd_showString(lcd_t,120,48,(uint8_t *)"R",
@@ -363,7 +423,7 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
     }
     else if (resistance <= 1000) {
 		snprintf(show_data, sizeof(show_data),
-				 "%6ld", resistance);
+				 "%6lu", (unsigned long)resistance);
 		lcd_showString(lcd_t,24,48,(uint8_t *)show_data,
 						   res_color, BLACK, 32, 0);
 		lcd_showString(lcd_t,120,48,(uint8_t *)"R",
@@ -373,7 +433,7 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
     else{
     	resistance = 0;
     	snprintf(show_data, sizeof(show_data),
-    					 "%6ld", resistance);
+    					 "%6lu", (unsigned long)resistance);
 		lcd_showString(lcd_t,24,48,(uint8_t *)show_data,
 						   res_color, BLACK, 32, 0);
     	lcd_showString(lcd_t,88,48,(uint8_t *)"OL.",
@@ -386,44 +446,40 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
 				   DARKGRAY, BLACK, 16, 0);
 }
 
-static void show_hint(lcd_interface *lcd_t)
-{
-	lcd_showString(lcd_t,0,48,(uint8_t *)"notice sw!",
-			ORANGE, BLACK, 32, 0);
-}
-
+/*
+ * Dispatch a resolved key event.
+ * KeyPress cycles the measurement mode; double/long press are reserved.
+ */
 static void key_handle(key_handle_t *key_t,lcd_interface *lcd_t,uint8_t *mode_sel,uint8_t *range_sel)
 {
-	if(key_t->key_state != KEY_NoPress){
-		switch(key_t->key_state)
-		{
-		case KeyPress:
-			lcd_fill(lcd_t,0,0,lcd_t->lcd_p->lcd_height,lcd_t->lcd_p->lcd_width,BLACK);
-			show_hint(lcd_t);
-			HAL_Delay(2000);
-			lcd_fill(lcd_t,0,0,lcd_t->lcd_p->lcd_height,lcd_t->lcd_p->lcd_width,BLACK);
-			if(*mode_sel == VOL_MODE){
-				*mode_sel = RES_MODE;
-			}else if(*mode_sel == RES_MODE){
-				*mode_sel = BUZ_MODE;
-			}
-			else if(*mode_sel == BUZ_MODE){
-				*mode_sel = VOL_MODE;
-			}
-			break;
-		case KeyDoublePress:
-			break;
-		case KeyLongPress:
-			break;
-		default:
-			break;
+	switch(key_t->key_state)
+	{
+	case KeyPress:
+		/* Clear the panel so the next page does not keep leftover pixels.
+		 * NOTE: keep the (height, width) argument order as-is: with the
+		 * 1.8" LCD in portrait mode (MADCTL with MV set) this transposed
+		 * window is what actually covers the whole panel. */
+		lcd_fill(lcd_t,0,0,lcd_t->lcd_p->lcd_height,lcd_t->lcd_p->lcd_width,BLACK);
+		if(*mode_sel == VOL_MODE){
+			*mode_sel = RES_MODE;
+		}else if(*mode_sel == RES_MODE){
+			*mode_sel = BUZ_MODE;
 		}
+		else if(*mode_sel == BUZ_MODE){
+			*mode_sel = VOL_MODE;
+		}
+		break;
+	case KeyDoublePress:
+	case KeyLongPress:
+	default:
+		/* Reserved for future features (e.g. calibration entry). */
+		break;
 	}
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-	if(GPIO_Pin == GPIO_PIN_9){
+	if(GPIO_Pin == MODE_Pin){
 		key_trigger_bit = 1;
 	}
 }

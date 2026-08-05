@@ -1,29 +1,33 @@
 /*
- * my_filter.c
+ * mid_filter.c
  *
- *  Created on: 2026年2月9日
- *      Author: jlc
+ * Moving-average filters used by the measurement pages.
+ *
+ *  Created on: 2026-02-09
+ *      Author: xiaoxiaobaijiangjun
  */
 #include "mid_filter.h"
 
-#define FILTER_N 16
+#define FILTER_N     16
 #define FILTER_RES_N 16
 
-static uint16_t filter_buf[FILTER_N] = {0};
-static uint32_t filter_sum = 0;
+/* Voltage filter: float samples (mV), keeps sub-millivolt resolution. */
+static float filter_buf[FILTER_N] = {0.0f};
+static float filter_sum = 0.0f;
 static uint8_t filter_index = 0;
 
+/* Resistance filter: integer samples (ohms). */
 static uint32_t filter_buf_res[FILTER_RES_N] = {0};
 static uint32_t filter_sum_res = 0;
 static uint8_t filter_index_res = 0;
 
-uint16_t Moving_Average(uint16_t new_value)
+float Moving_Average(float new_value)
 {
-    filter_sum -= filter_buf[filter_index];  // Subtract the old value
+    filter_sum -= filter_buf[filter_index];   /* drop the oldest sample */
 
-    filter_buf[filter_index] = new_value;    // Store new value
+    filter_buf[filter_index] = new_value;     /* store the new sample   */
 
-    filter_sum += new_value;                 // Add new values
+    filter_sum += new_value;
 
     filter_index++;
     if(filter_index >= FILTER_N)
@@ -34,11 +38,11 @@ uint16_t Moving_Average(uint16_t new_value)
 
 uint32_t Moving_Average_res(uint32_t new_value)
 {
-    filter_sum_res -= filter_buf_res[filter_index_res];  // Subtract the old value
+    filter_sum_res -= filter_buf_res[filter_index_res];
 
-    filter_buf_res[filter_index_res] = new_value;    // Store new value
+    filter_buf_res[filter_index_res] = new_value;
 
-    filter_sum_res += new_value;                 // Add new values
+    filter_sum_res += new_value;
 
     filter_index_res++;
     if(filter_index_res >= FILTER_RES_N)
