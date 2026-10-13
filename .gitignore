@@ -1,2 +1,8 @@
-﻿Debug/
-.settings/
+/Debug/
+/Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.o
+*.d
