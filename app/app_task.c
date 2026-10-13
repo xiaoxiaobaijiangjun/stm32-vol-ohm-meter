@@ -12,6 +12,7 @@
 #include "../hardware/hw_lcdinit.h"
 #include "../middle/mid_lcd.h"
 #include "../middle/mid_filter.h"
+#include "../middle/mid_calib.h"
 #include "stdio.h"
 #include "adc.h"
 
@@ -63,11 +64,40 @@ void init_task(void)
 	lcd_fill(&lcd_t,0,0,lcd_t.lcd_p->lcd_height,lcd_t.lcd_p->lcd_width,BLACK);
 	HAL_ADCEx_Calibration_Start(&hadc1);
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_CH_NUM);
+	CAL_Init();		/* calibration storage + UART console / BLE channel */
+}
+
+/*
+ * CAL session banner: redrawn every 250 ms while the console session is
+ * alive (page switches clear the panel, so a draw-once flag would go stale).
+ */
+static void cal_banner(void)
+{
+	static uint8_t shown = 0U;
+	static uint32_t last_draw = 0U;
+	uint32_t now = HAL_GetTick();
+
+	if(CAL_Is_Active())
+	{
+		shown = 1U;
+		if((now - last_draw) >= 250U)
+		{
+			last_draw = now;
+			lcd_showString(&lcd_t,120,20,(uint8_t *)"CAL", YELLOW, BLACK, 16, 0);
+		}
+	}
+	else if(shown)
+	{
+		shown = 0U;
+		lcd_showString(&lcd_t,120,20,(uint8_t *)"   ", BLACK, BLACK, 16, 0);
+	}
 }
 
 void cycle_task(void)
 {
 	process_key_event();
+	CAL_Service();
+	cal_banner();
 	if(mode_sel == VOL_MODE){
 		show_volatge_page(&lcd_t,&adc_buf[0],&range_sel);
 	}
@@ -225,7 +255,14 @@ static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *ra
 			sign = 0;
 		}
     }
-    vin_vol = (uint16_t)(Moving_Average(filter_vol) + 0.5f);
+    /* two-point calibration: publish the raw value, then apply k*x+b */
+    {
+        uint8_t cidx = (*range == VOL_RANGE_0_5) ? CAL_IDX_VOL_0_5 : CAL_IDX_VOL_5_15;
+        float cal_v = Moving_Average(filter_vol);
+        CAL_Publish_Raw(cidx, cal_v);
+        cal_v = CAL_Apply(cidx, cal_v);
+        vin_vol = (uint16_t)(cal_v + (cal_v >= 0.0f ? 0.5f : -0.5f));
+    }
     if (vin_vol < 5000) {
         vol_color = GREEN;
     } else if (vin_vol < 10000) {
@@ -337,6 +374,18 @@ static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t 
     	}
     }
     resistance = Moving_Average_res(resistance);
+    /* two-point calibration: publish the raw value, then apply k*x+b */
+    {
+        uint8_t cidx = (*range == RES_RANGE_0_1) ? CAL_IDX_RES_0_1 : CAL_IDX_RES_1_100;
+        float cal_r;
+        CAL_Publish_Raw(cidx, (float)resistance);
+        cal_r = CAL_Apply(cidx, (float)resistance);
+        if(cal_r < 0.0f)
+        {
+            cal_r = 0.0f;
+        }
+        resistance = (uint32_t)(cal_r + 0.5f);
+    }
     if (resistance < 1000) {
         snprintf(show_data, sizeof(show_data),
                  "%6lu", (unsigned long)resistance);
@@ -412,6 +461,17 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
     	resistance = 9999;
     }
     resistance = Moving_Average_res(resistance);
+    /* continuity uses the calibrated 0-1K pair as well */
+    {
+        float cal_r;
+        CAL_Publish_Raw(CAL_IDX_RES_0_1, (float)resistance);
+        cal_r = CAL_Apply(CAL_IDX_RES_0_1, (float)resistance);
+        if(cal_r < 0.0f)
+        {
+            cal_r = 0.0f;
+        }
+        resistance = (uint32_t)(cal_r + 0.5f);
+    }
     if(resistance <= 15){
     	snprintf(show_data, sizeof(show_data),
 				 "%6lu", (unsigned long)resistance);
