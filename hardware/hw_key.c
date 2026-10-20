@@ -2,7 +2,7 @@
 
 /*
  * Function Content: key instance registration
- * Function Parameter: key gpio„ÄÅpin and press_level
+ * Function Parameter: key gpio°¢pin and press_level
  * Return Value: KEY_HandleDef
  */
 key_handle_t Key_Init(GPIO_TypeDef *key_gpio,uint16_t key_pin,uint8_t key_press_level)

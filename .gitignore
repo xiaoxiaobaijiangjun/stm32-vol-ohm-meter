@@ -6,3 +6,11 @@
 *.map
 *.o
 *.d
+/MDK-ARM/Objects/
+/MDK-ARM/Listings/
+*.uvguix.*
+/MDK-ARM/DebugConfig/
+*.log
+*.dep
+*.crf
+*.lst
