@@ -54,14 +54,13 @@ static float old_vol2_val;
 static uint32_t key_last_scan_tick = 0;		/* tick of the last Key_Scanf() call */
 static uint32_t key_event_start_tick = 0;	/* tick when the current key event began */
 
-/* Reference fixture true values: replace with the values measured by the
- * reference multimeter BEFORE the bench session (units mV / ohm, indexed
- * like the CAL_IDX_* ranges). MUST-EDIT before benching. */
+/* Reference fixture true values, measured with the reference multimeter
+ * 2026-10-23 (units mV / ohm, indexed like the CAL_IDX_* ranges). */
 static const float CAL_FIXTURE_Y[CAL_RANGE_COUNT] = {
-    3312.0f,    /* [0] 0-5V range: 3.3V rail, placeholder */
-    9000.0f,    /* [1] 5-15V range: 9V battery, placeholder */
-    330.0f,     /* [2] 0-1K range: 330 ohm, placeholder */
-    10000.0f,   /* [3] 1K-100K range: 10k ohm, placeholder */
+    1610.0f,    /* [0] 0-5V range: 1.5V cell, DMM 2026-10-23 */
+    9090.0f,    /* [1] 5-15V range: 9V battery, DMM 2026-10-23 */
+    324.0f,     /* [2] 0-1K range: 330R resistor, DMM 2026-10-23 */
+    9960.0f,    /* [3] 1K-100K range: 10kR resistor, DMM 2026-10-23 */
 };
 /* minimum |x2 - x1| per range (mV / ohm): two points too close make k explode */
 static const float CAL_MIN_SPAN[CAL_RANGE_COUNT] = {500.0f, 1000.0f, 100.0f, 2000.0f};
@@ -185,6 +184,14 @@ static void process_key_event(void)
 		/* Debounce finished: dispatch the event and close the handling. */
 		key_handle(&mode_key,&lcd_t,&mode_sel,&range_sel);
 		mode_key.key_state = KEY_NoPress;
+		/* The safety net below reports a plain click ~50 ms after the
+		 * release, long before Key_Scanf's own click path does, so the
+		 * debouncer's pending state is left dangling once scanning stops.
+		 * Clear it here, otherwise the next long press is misread as
+		 * the second click of a double press (KeyDoublePress, a no-op). */
+		mode_key.keyCount = 0;
+		mode_key.keyFcnt = 0;
+		mode_key.keyLongFlag = 0;
 		key_trigger_bit = 0;
 		key_event_start_tick = 0;
 		return;
@@ -213,8 +220,12 @@ static void process_key_event(void)
 
 	/* Safety net: the key is already released but the debouncer did not
 	 * report an event (tap shorter than the 20 ms debounce window).
-	 * Complete the press so the button can never get stuck. */
-	if((HAL_GPIO_ReadPin(mode_key.key_gpio,mode_key.key_pin) != mode_key.key_press_level)
+	 * Complete the press so the button can never get stuck. Must not
+	 * override an event Key_Scanf just reported (a long press released
+	 * after 1 s reports KeyLongPress here and used to be overwritten
+	 * into a plain KeyPress). */
+	if((mode_key.key_state == KEY_NoPress)
+		&& (HAL_GPIO_ReadPin(mode_key.key_gpio,mode_key.key_pin) != mode_key.key_press_level)
 		&& ((now - key_event_start_tick) >= 50)){
 		mode_key.key_state = KeyPress;
 	}
