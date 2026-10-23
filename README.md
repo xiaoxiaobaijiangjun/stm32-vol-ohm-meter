@@ -36,6 +36,18 @@
 
 电源 Type-C 5V 进 LDO 出 3.3V，XD7660 电荷泵产生 -5V 给运放，TL431（0.5%）分压出 1.65V 基准。
 
+## 板载开关
+
+上边缘三个 SK12D07VG5 拨动开关，拨柄推向丝印一侧即选中该侧链路；左边缘为电源开关。软件模式和硬件开关要配合，拨错时读数无意义（LCD 底部提示行如 `1k-100K<--sw-->0R-1K` 即提醒对应开关）：
+
+| 测什么 | LCD 模式 | RES/VOL | 电阻量程 | 电压量程 |
+|---|---|---|---|---|
+| 电压 0-5V | Mode:Vol | VOL | 任意 | 0-5V |
+| 电压 5-15V | Mode:Vol | VOL | 任意 | 5V-15V |
+| 电阻 0R-1K | Mode:Res | RES | 0R-1K | 任意 |
+| 电阻 1K-100K | Mode:Res | RES | 1K-100K | 任意 |
+| 通断 | Mode:Buz | RES | 0R-1K | 任意 |
+
 ## 软件
 
 裸机前后台：`Core/` 是 CubeMX 生成的 HAL 层，`hardware/` 是 LCD 和按键驱动，`middle/` 是滤波和校准，`app/` 是三种模式的页面与测量算法。ADC 在 DMA 中断里累加，凑满 64 轮置标志，主循环取数刷新。
@@ -43,6 +55,18 @@
 ## 编译
 
 Keil MDK 打开 `MDK-ARM/stm32-vol-ohm-meter.uvprojx`（AC5），也可用 STM32CubeIDE 导入。注意 `middle/mid_lcdfont.h`、`hardware/hw_key.c` 含中文字面量，必须保持 GBK 编码，UTF-8 会在 armcc 下报 `missing closing quote`。
+
+## 校准
+
+串口控制台走 USART1（PA9=TX、PA10=RX），9600 8N1。USB-TTL 接 PA9/PA10/GND，在仓库根目录：
+
+```
+python tools/cal_host.py --port COMx status      # 查看当前校准参数
+python tools/cal_host.py --port COMx calibrate   # 四量程两点校准向导
+python tools/cal_host.py --port COMx monitor     # 实时看测量上报
+```
+
+向导按量程逐个测两点（万用表读数作真值），解算 k/b 后写入 Flash。参数带 magic/CRC 校验，损坏或越界自动回退 k=1、b=0。
 
 ## 已知问题
 
