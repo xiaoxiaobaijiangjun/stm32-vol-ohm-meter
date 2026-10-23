@@ -14,6 +14,7 @@
 #include "../middle/mid_filter.h"
 #include "../middle/mid_calib.h"
 #include "stdio.h"
+#include "stdlib.h"
 #include "adc.h"
 
 #define ADC_CH_NUM		7		/* number of ADC channels scanned by DMA   */
@@ -53,12 +54,52 @@ static float old_vol2_val;
 static uint32_t key_last_scan_tick = 0;		/* tick of the last Key_Scanf() call */
 static uint32_t key_event_start_tick = 0;	/* tick when the current key event began */
 
+/* Reference fixture true values: replace with the values measured by the
+ * reference multimeter BEFORE the bench session (units mV / ohm, indexed
+ * like the CAL_IDX_* ranges). MUST-EDIT before benching. */
+static const float CAL_FIXTURE_Y[CAL_RANGE_COUNT] = {
+    3312.0f,    /* [0] 0-5V range: 3.3V rail, placeholder */
+    9000.0f,    /* [1] 5-15V range: 9V battery, placeholder */
+    330.0f,     /* [2] 0-1K range: 330 ohm, placeholder */
+    10000.0f,   /* [3] 1K-100K range: 10k ohm, placeholder */
+};
+/* minimum |x2 - x1| per range (mV / ohm): two points too close make k explode */
+static const float CAL_MIN_SPAN[CAL_RANGE_COUNT] = {500.0f, 1000.0f, 100.0f, 2000.0f};
+
+/* onboard calibration UI state machine (implementation before key_handle) */
+typedef enum {
+    CAL_UI_IDLE = 0,    /* not running                                  */
+    CAL_UI_SHORT,       /* step 1: short the probes, click to capture x1 */
+    CAL_UI_REF,         /* step 2: apply the fixture, click to capture x2 */
+    CAL_UI_COLLECT,     /* averaging samples for the current step        */
+    CAL_UI_OK_ERR       /* final banner, auto exit                       */
+} cal_ui_state_t;
+
+#define CAL_UI_SAMPLE_MS   30U     /* min spacing between capture samples */
+#define CAL_UI_SAMPLE_N    8U      /* samples averaged per capture point  */
+#define CAL_UI_TIMEOUT_MS  3000U   /* whole-capture timeout               */
+#define CAL_UI_BANNER_MS   1500U   /* CAL OK / CAL ERR display time       */
+
+static cal_ui_state_t cal_ui_state = CAL_UI_IDLE;
+static uint8_t  cal_ui_cidx = 0U;           /* range snapshot at entry     */
+static uint8_t  cal_ui_collecting_x2 = 0U;  /* 1 = COLLECT gathers x2      */
+static float    cal_ui_x1 = 0.0f;
+static uint32_t cal_ui_step_tick = 0U;
+static uint32_t cal_ui_last_sample_tick = 0U;
+static uint8_t  cal_ui_samples = 0U;
+static float    cal_ui_sum = 0.0f;
+static uint8_t  cal_ui_ok = 0U;
+static uint32_t cal_ui_banner_tick = 0U;
+static uint32_t cal_ui_draw_tick = 0U;
+
+
 static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range);
 static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range);
 static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range);
 static void key_handle(key_handle_t *key_t,lcd_interface *lcd_t,uint8_t *mode_sel,uint8_t *range_sel);
 static void process_key_event(void);
 static void reset_adc_gather(uint16_t * adc_buf);
+static void cal_ui_service(void);
 
 void init_task(void)
 {
@@ -83,7 +124,7 @@ static void cal_banner(void)
 	static uint32_t last_draw = 0U;
 	uint32_t now = HAL_GetTick();
 
-	if(CAL_Is_Active())
+	if(CAL_Is_Active() || (cal_ui_state != CAL_UI_IDLE))
 	{
 		shown = 1U;
 		if((now - last_draw) >= 250U)
@@ -113,6 +154,7 @@ void cycle_task(void)
 	else if(mode_sel == BUZ_MODE){
 		show_beep_page(&lcd_t,&adc_buf[0],&range_sel);
 	}
+	cal_ui_service();
 }
 
 /*
@@ -291,9 +333,11 @@ static void show_volatge_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *ra
     lcd_showString(lcd_t,120,48,(uint8_t *)"V",
     				LGRAY, BLACK, 32, 0);
 
+    if(cal_ui_state == CAL_UI_IDLE){
     lcd_showString(lcd_t,0,110,
                    (uint8_t *)"0-5V<---sw--->5V-15V",
 				   DARKGRAY, BLACK, 16, 0);
+    }
 }
 
 static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range)
@@ -451,9 +495,11 @@ static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t 
         }
     }
 
+    if(cal_ui_state == CAL_UI_IDLE){
     lcd_showString(lcd_t,0,110,
                    (uint8_t *)"1k-100K<--sw-->0R-1K",
                    DARKGRAY, BLACK, 16, 0);
+    }
 }
 
 
@@ -552,12 +598,223 @@ static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range
 				   DARKGRAY, BLACK, 16, 0);
 }
 
+/* ---------------- onboard calibration UI (long-press entry) ----------------
+ * Two-point calibration without a host PC: point 1 is free (shorted probes
+ * read 0 V / 0 ohm), point 2 is the reference fixture (CAL_FIXTURE_Y).
+ * The measurement page keeps running: it is what publishes the raw value
+ * the capture averages. Key mapping while active: click = capture point,
+ * long press = abort without saving, double press ignored, mode switching
+ * suppressed.
+ */
+static void cal_ui_show_line(uint16_t y, const char *s, uint16_t color)
+{
+    char line[17];
+    uint8_t i = 0U;
+
+    while((i < 16U) && (s[i] != '\0'))
+    {
+        line[i] = s[i];
+        i++;
+    }
+    while(i < 16U)
+    {
+        line[i] = ' ';   /* pad with spaces to wipe what was there */
+        i++;
+    }
+    line[16] = '\0';
+    lcd_showString(&lcd_t,0,y,(uint8_t *)line, color, BLACK, 16, 0);
+}
+
+static void cal_ui_enter(uint8_t cidx)
+{
+    /* NOTE: keep the (height, width) argument order, see key_handle. */
+    lcd_fill(&lcd_t,0,0,lcd_t.lcd_p->lcd_height,lcd_t.lcd_p->lcd_width,BLACK);
+    HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+    cal_ui_cidx = cidx;
+    cal_ui_x1 = 0.0f;
+    cal_ui_collecting_x2 = 0U;
+    cal_ui_state = CAL_UI_SHORT;
+    cal_ui_draw_tick = 0U;   /* force an immediate prompt draw */
+}
+
+static void cal_ui_exit(void)
+{
+    cal_ui_state = CAL_UI_IDLE;
+    HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+    /* NOTE: keep the (height, width) argument order, see key_handle. */
+    lcd_fill(&lcd_t,0,0,lcd_t.lcd_p->lcd_height,lcd_t.lcd_p->lcd_width,BLACK);
+}
+
+/* short confirmation beep (blocking 30 ms, acceptable for a one-shot cue) */
+static void cal_ui_beep(void)
+{
+    HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_SET);
+    HAL_Delay(30);
+    HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+}
+
+static void cal_ui_fail(void)
+{
+    cal_ui_ok = 0U;
+    cal_ui_state = CAL_UI_OK_ERR;
+    cal_ui_banner_tick = HAL_GetTick();
+}
+
+static void cal_ui_capture_done(float x)
+{
+    if(!cal_ui_collecting_x2)
+    {
+        cal_ui_x1 = x;
+        cal_ui_state = CAL_UI_REF;   /* step 2: fixture point */
+        return;
+    }
+    /* solve y = k*x + b from (x1, 0) and (x2, CAL_FIXTURE_Y[cidx]) */
+    {
+        float y2 = CAL_FIXTURE_Y[cal_ui_cidx];
+        float dx = x - cal_ui_x1;
+        float adx = (dx >= 0.0f) ? dx : -dx;
+        float k, b;
+
+        if(adx < CAL_MIN_SPAN[cal_ui_cidx])
+        {
+            cal_ui_fail();   /* points too close: k would explode */
+            return;
+        }
+        k = y2 / dx;
+        b = -k * cal_ui_x1;
+        if(CAL_Onboard_Set(cal_ui_cidx, k, b))
+        {
+            cal_ui_ok = 1U;
+            cal_ui_state = CAL_UI_OK_ERR;
+            cal_ui_banner_tick = HAL_GetTick();
+            cal_ui_beep();
+        }
+        else
+        {
+            cal_ui_fail();   /* k/b sanity window or flash write failed */
+        }
+    }
+}
+
+static void cal_ui_key(uint8_t key_state)
+{
+    if(key_state == KeyPress)
+    {
+        if((cal_ui_state == CAL_UI_SHORT) || (cal_ui_state == CAL_UI_REF))
+        {
+            /* start the capture for the current step */
+            cal_ui_beep();
+            cal_ui_collecting_x2 = (cal_ui_state == CAL_UI_REF) ? 1U : 0U;
+            cal_ui_samples = 0U;
+            cal_ui_sum = 0.0f;
+            cal_ui_step_tick = HAL_GetTick();
+            cal_ui_last_sample_tick = cal_ui_step_tick;
+            cal_ui_state = CAL_UI_COLLECT;
+        }
+        /* clicks during COLLECT / OK_ERR are ignored */
+    }
+    else if(key_state == KeyLongPress)
+    {
+        cal_ui_exit();   /* abort: leave without saving */
+    }
+    /* KeyDoublePress: ignored */
+}
+
+static void cal_ui_service(void)
+{
+    float raw = 0.0f;
+    uint8_t have_raw;
+    uint32_t now = HAL_GetTick();
+
+    if(cal_ui_state == CAL_UI_IDLE)
+    {
+        return;
+    }
+
+    have_raw = CAL_Get_Raw(cal_ui_cidx, &raw);
+
+    if(cal_ui_state == CAL_UI_COLLECT)
+    {
+        if((now - cal_ui_step_tick) > CAL_UI_TIMEOUT_MS)
+        {
+            cal_ui_fail();   /* capture timed out (page stopped feeding) */
+        }
+        else if(have_raw && ((now - cal_ui_last_sample_tick) >= CAL_UI_SAMPLE_MS))
+        {
+            cal_ui_last_sample_tick = now;
+            cal_ui_sum += raw;
+            cal_ui_samples++;
+            if(cal_ui_samples >= CAL_UI_SAMPLE_N)
+            {
+                cal_ui_capture_done(cal_ui_sum / (float)CAL_UI_SAMPLE_N);
+            }
+        }
+    }
+    else if((cal_ui_state == CAL_UI_OK_ERR)
+            && ((now - cal_ui_banner_tick) >= CAL_UI_BANNER_MS))
+    {
+        cal_ui_exit();
+        return;
+    }
+
+    if((now - cal_ui_draw_tick) >= 200U)
+    {
+        const char *prompt;
+        uint16_t prompt_color = YELLOW;
+        char buf[24];
+
+        cal_ui_draw_tick = now;
+        switch(cal_ui_state)
+        {
+        case CAL_UI_SHORT:
+        case CAL_UI_COLLECT:
+            prompt = (cal_ui_collecting_x2) ? "CAL2:REF KEY" : "CAL1:SHORT KEY";
+            break;
+        case CAL_UI_REF:
+            prompt = "CAL2:REF KEY";
+            break;
+        default:
+            prompt = cal_ui_ok ? "CAL OK" : "CAL ERR";
+            prompt_color = cal_ui_ok ? GREEN : RED;
+            break;
+        }
+        cal_ui_show_line(110, prompt, prompt_color);
+
+        /* live pre-calibration value so the user can see it settle */
+        if(have_raw && (cal_ui_state != CAL_UI_OK_ERR))
+        {
+            if((cal_ui_cidx == CAL_IDX_VOL_0_5) || (cal_ui_cidx == CAL_IDX_VOL_5_15))
+            {
+                long mv = (long)(raw + ((raw >= 0.0f) ? 0.5f : -0.5f));
+                (void)snprintf(buf, sizeof(buf), "x=%s%ld.%03ldV",
+                               (mv < 0) ? "-" : "",
+                               labs(mv) / 1000L, labs(mv) % 1000L);
+            }
+            else
+            {
+                long ohm = (long)(raw + 0.5f);
+                (void)snprintf(buf, sizeof(buf), "x=%ldR", ohm);
+            }
+            cal_ui_show_line(80, buf, WHITE);
+        }
+    }
+}
+
 /*
  * Dispatch a resolved key event.
- * KeyPress cycles the measurement mode; double/long press are reserved.
+ * KeyPress cycles the measurement mode; KeyLongPress enters the onboard
+ * calibration UI from the voltage/resistance page; double press is a no-op.
+ * While the calibration UI is active it owns the key completely: click =
+ * capture point, long press = abort, mode switching suppressed.
  */
 static void key_handle(key_handle_t *key_t,lcd_interface *lcd_t,uint8_t *mode_sel,uint8_t *range_sel)
 {
+	if(cal_ui_state != CAL_UI_IDLE)
+	{
+		cal_ui_key(key_t->key_state);
+		return;
+	}
+
 	switch(key_t->key_state)
 	{
 	case KeyPress:
@@ -575,10 +832,25 @@ static void key_handle(key_handle_t *key_t,lcd_interface *lcd_t,uint8_t *mode_se
 			*mode_sel = VOL_MODE;
 		}
 		break;
-	case KeyDoublePress:
 	case KeyLongPress:
+		/* enter onboard calibration: snapshots the range shown right now
+		 * (the buzzer page has no calibration range, ignore it there) */
+		if((*mode_sel == VOL_MODE) || (*mode_sel == RES_MODE))
+		{
+			uint8_t cidx;
+			if(*mode_sel == VOL_MODE)
+			{
+				cidx = (*range_sel == VOL_RANGE_0_5) ? CAL_IDX_VOL_0_5 : CAL_IDX_VOL_5_15;
+			}
+			else
+			{
+				cidx = (*range_sel == RES_RANGE_0_1) ? CAL_IDX_RES_0_1 : CAL_IDX_RES_1_100;
+			}
+			cal_ui_enter(cidx);
+		}
+		break;
+	case KeyDoublePress:
 	default:
-		/* Reserved for future features (e.g. calibration entry). */
 		break;
 	}
 }

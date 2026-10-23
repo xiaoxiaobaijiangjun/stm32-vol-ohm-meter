@@ -156,6 +156,54 @@ void CAL_Publish_Raw(uint8_t idx, float x)
 	g_last_idx = idx;
 }
 
+/* ---------------- onboard calibration (no host PC needed) ------------------ */
+uint8_t CAL_Get_Raw(uint8_t idx, float *x)
+{
+	if(idx >= CAL_RANGE_COUNT || (x == NULL))
+	{
+		return 0U;
+	}
+	if((HAL_GetTick() - g_x_tick[idx]) > 500U)
+	{
+		return 0U;   /* stale: that range's page is not running */
+	}
+	*x = g_x[idx];
+	return 1U;
+}
+
+uint8_t CAL_Onboard_Set(uint8_t idx, float k, float b)
+{
+	float new_k[CAL_RANGE_COUNT];
+	float new_b[CAL_RANGE_COUNT];
+	uint8_t i;
+
+	if(idx >= CAL_RANGE_COUNT)
+	{
+		return 0U;
+	}
+	/* same sanity window as cal_store_load(), so what is written now also
+	 * survives the load check after the next power cycle */
+	if(!(k > 0.05f && k < 20.0f && b > -1000000.0f && b < 1000000.0f))
+	{
+		return 0U;
+	}
+	for(i = 0U; i < CAL_RANGE_COUNT; i++)
+	{
+		new_k[i] = g_k[i];
+		new_b[i] = g_b[i];
+	}
+	new_k[idx] = k;
+	new_b[idx] = b;
+	if(!cal_store_save(new_k, new_b))
+	{
+		return 0U;   /* flash write failed: keep the running RAM pair */
+	}
+	g_k[idx] = k;
+	g_b[idx] = b;
+	g_src_flash = 1U;
+	return 1U;
+}
+
 uint8_t CAL_Is_Active(void)
 {
 	return g_session;

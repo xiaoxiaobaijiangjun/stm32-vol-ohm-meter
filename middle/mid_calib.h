@@ -32,5 +32,12 @@ void    CAL_Publish_Raw(uint8_t idx, float x); /* pages feed pre-cal values */
 float   CAL_Apply(uint8_t idx, float x);       /* apply k*x+b (identity-safe)*/
 uint8_t CAL_Is_Active(void);                   /* console session running   */
 uint8_t CAL_Report_Enabled(void);              /* BLE 1 Hz report on        */
+/* read the raw value range idx just published; 1 = fresh within 500 ms
+ * (used by the onboard calibration UI) */
+uint8_t CAL_Get_Raw(uint8_t idx, float *x);
+/* onboard calibration: update one k/b pair in RAM and rewrite the whole
+ * table to flash (reuses the console save path) */
+uint8_t CAL_Onboard_Set(uint8_t idx, float k, float b);
+
 
 #endif /* MID_CALIB_H_ */
