@@ -24,6 +24,12 @@
 #define RES_MODE		0x05	/* resistance measurement mode             */
 #define VOL_MODE		0x06	/* voltage measurement mode                */
 #define BUZ_MODE		0x07	/* continuity (buzzer) mode                */
+/* Open-circuit / overrange detection thresholds for the resistance
+ * page. Initial values from design analysis: refine on the bench. */
+#define CAL_OPEN_I_MIN   0.0001f   /* A, constant-current floor: below = open */
+#define CAL_RES1_SAT_V   3.25f     /* V, 0-1K front-end saturation threshold  */
+#define CAL_RES2_FLOOR_V 0.05f     /* V, 1K-100K divider midpoint floor       */
+
 
 static lcd_parameter lcd_p;
 static lcd_interface lcd_t;
@@ -304,15 +310,22 @@ static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t 
      *
      * The range is auto-detected from res1_in and the beeper gives an
      * audible cue near the range limits.
+     *
+     * Open circuit / overrange shows "OL." instead of a bogus value: with
+     * the leads open the constant-current source collapses and the raw
+     * division result is garbage (an open would look like a short). OL
+     * readings stay out of the moving-average filter and out of the
+     * calibration raw cache on purpose.
      */
     char show_data[32];
     uint16_t res_color = 0;
     uint32_t resistance = 0;
     float ref165_vol = 0,res1_in = 0,res2_in = 0,ref230_vol = 0;
     float current_val = 0;
+    uint8_t ol_flag = 0;
 
     if(adc_dma_done != 1){
-    	return;
+        return;
     }
     ref_165_sum = ref_165_sum >> 6;
     ref_230_sum = ref_230_sum >> 6;
@@ -331,85 +344,118 @@ static void show_resistance_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t 
 
 
     lcd_showString(lcd_t,12,2,(uint8_t *)"Mode:Res",
-    				WHITE, BLACK, 16, 0);
+                    WHITE, BLACK, 16, 0);
 
     if(res1_in < 3.30f){
-    	*range = RES_RANGE_0_1;
+        *range = RES_RANGE_0_1;
     }else{
-    	*range = RES_RANGE_1_100;
+        *range = RES_RANGE_1_100;
+    }
+
+    /* OL guard #0: constant-current source collapsed (leads open),
+     * checked before any division uses current_val. */
+    if(current_val < CAL_OPEN_I_MIN){
+        ol_flag = 1;
     }
 
     if(*range == RES_RANGE_0_1){
-    	lcd_showString(lcd_t,100,2,(uint8_t *)"0K---1K",
-    	    				LGRAY, BLACK, 16, 0);
-    	resistance = (res1_in / current_val) + 0.5f;
-    	res_color = WHITE;
-    	if(resistance > 1000 && resistance<= 3000){
-    		HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_SET);
-    		HAL_Delay(50);
-    		HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
-		}
-    	else if(resistance > 3000)
-    	{
-    		resistance = 0;
-    		HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
-    	}
-    }else{
-    	lcd_showString(lcd_t,100,2,(uint8_t *)"1K-100K",
-							LGRAY, BLACK, 16, 0);
-    	resistance = (10000.0f) * (res2_in / ((ref165_vol * 2.0f) - res2_in))+0.5f;
-    	if (resistance < 47000) {
-			res_color = ORANGE;
-		} else {
-			res_color = YELLOW;
-		}
-    	if((resistance > 100000) && (resistance <= 150000)){
-    		HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_SET);
-			HAL_Delay(50);
-			HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
-		}
-    	else if(resistance > 150000){
-    		resistance = 0;
-			HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
-    	}
-    }
-    resistance = Moving_Average_res(resistance);
-    /* two-point calibration: publish the raw value, then apply k*x+b */
-    {
-        uint8_t cidx = (*range == RES_RANGE_0_1) ? CAL_IDX_RES_0_1 : CAL_IDX_RES_1_100;
-        float cal_r;
-        CAL_Publish_Raw(cidx, (float)resistance);
-        cal_r = CAL_Apply(cidx, (float)resistance);
-        if(cal_r < 0.0f)
-        {
-            cal_r = 0.0f;
+        lcd_showString(lcd_t,100,2,(uint8_t *)"0K---1K",
+                        LGRAY, BLACK, 16, 0);
+        res_color = WHITE;
+        if(!ol_flag && (res1_in >= CAL_RES1_SAT_V)){
+            ol_flag = 1;    /* front-end saturated */
         }
-        resistance = (uint32_t)(cal_r + 0.5f);
+        if(!ol_flag){
+            resistance = (res1_in / current_val) + 0.5f;
+            if(resistance > 3000){
+                ol_flag = 1;    /* overrange */
+            }
+            else if(resistance > 1000){
+                /* near the range limit: audible cue (blocking, known gap) */
+                HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_SET);
+                HAL_Delay(50);
+                HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+            }
+        }
+    }else{
+        lcd_showString(lcd_t,100,2,(uint8_t *)"1K-100K",
+                            LGRAY, BLACK, 16, 0);
+        if(!ol_flag && ((res2_in < CAL_RES2_FLOOR_V)
+                        || (res2_in >= (ref165_vol * 2.0f)))){
+            ol_flag = 1;    /* open circuit / divider midpoint collapsed */
+        }
+        if(!ol_flag){
+            resistance = (10000.0f) * (res2_in / ((ref165_vol * 2.0f) - res2_in))+0.5f;
+            if(resistance > 150000){
+                ol_flag = 1;    /* overrange */
+            }
+        }
+        if(!ol_flag){
+            if (resistance < 47000) {
+                res_color = ORANGE;
+            } else {
+                res_color = YELLOW;
+            }
+            if(resistance > 100000){
+                /* near the range limit: audible cue (blocking, known gap) */
+                HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_SET);
+                HAL_Delay(50);
+                HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+            }
+        }
     }
-    if (resistance < 1000) {
-        snprintf(show_data, sizeof(show_data),
-                 "%6lu", (unsigned long)resistance);
-    } else {
-        snprintf(show_data, sizeof(show_data),
-                 "%3lu.%02lu",
-                 (unsigned long)(resistance / 1000),
-                 (unsigned long)((resistance % 1000) / 10));
-    }
-    lcd_showString(lcd_t,24,48,(uint8_t *)show_data,
-                   res_color, BLACK, 32, 0);
 
-    if (resistance < 1000) {
-    	lcd_showString(lcd_t,120,48,(uint8_t *)"R",
-        				LGRAY, BLACK, 32, 0);
-    }else {
-    	lcd_showString(lcd_t,120,48,(uint8_t *)"K",
-    	        				LGRAY, BLACK, 32, 0);
+    if(ol_flag){
+        /* OL: keep the garbage reading out of the filter and of the
+         * calibration raw cache, clear the value slot and flag OL.,
+         * and make sure the beeper stays off. */
+        HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+        lcd_showString(lcd_t,24,48,(uint8_t *)"      ",
+                        LGRAY, BLACK, 32, 0);
+        lcd_showString(lcd_t,64,48,(uint8_t *)"OL.",
+                        LGRAY, BLACK, 32, 0);
+        lcd_showString(lcd_t,120,48,(uint8_t *)"R",
+                        LGRAY, BLACK, 32, 0);
+    }else{
+        resistance = Moving_Average_res(resistance);
+        /* two-point calibration: publish the raw value, then apply k*x+b */
+        {
+            uint8_t cidx = (*range == RES_RANGE_0_1) ? CAL_IDX_RES_0_1 : CAL_IDX_RES_1_100;
+            float cal_r;
+            CAL_Publish_Raw(cidx, (float)resistance);
+            cal_r = CAL_Apply(cidx, (float)resistance);
+            if(cal_r < 0.0f)
+            {
+                cal_r = 0.0f;
+            }
+            resistance = (uint32_t)(cal_r + 0.5f);
+        }
+        if (resistance < 1000) {
+            snprintf(show_data, sizeof(show_data),
+                     "%6lu", (unsigned long)resistance);
+        } else {
+            snprintf(show_data, sizeof(show_data),
+                     "%3lu.%02lu",
+                     (unsigned long)(resistance / 1000),
+                     (unsigned long)((resistance % 1000) / 10));
+        }
+        lcd_showString(lcd_t,24,48,(uint8_t *)show_data,
+                       res_color, BLACK, 32, 0);
+
+        if (resistance < 1000) {
+            lcd_showString(lcd_t,120,48,(uint8_t *)"R",
+                            LGRAY, BLACK, 32, 0);
+        }else {
+            lcd_showString(lcd_t,120,48,(uint8_t *)"K",
+                            LGRAY, BLACK, 32, 0);
+        }
     }
 
     lcd_showString(lcd_t,0,110,
                    (uint8_t *)"1k-100K<--sw-->0R-1K",
-				   DARKGRAY, BLACK, 16, 0);
+                   DARKGRAY, BLACK, 16, 0);
 }
+
 
 
 static void show_beep_page(lcd_interface *lcd_t,uint16_t *adc_buf,uint8_t *range)
